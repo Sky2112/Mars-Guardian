@@ -73,10 +73,13 @@ static func hazard_contains(h: Dictionary, ll: Vector2, extra_km: float = 0.0) -
 ## Signed distance to a hazard's edge in km (negative = inside).
 static func edge_dist(h: Dictionary, ll: Vector2) -> float:
 	var d := dist_km(ll, h["ll"])
+	var r: float = h["r"]
 	var r_in: float = h["r_in"]
-	if r_in > 0.0:
-		return minf(d - float(h["r"]), r_in - d) if d < float(h["r"]) else d - float(h["r"])
-	return d - float(h["r"])
+	if d > r or r_in <= 0.0:
+		return d - r
+	if d < r_in:
+		return r_in - d          # inside the hole of a ring: permitted ground, distance to the inner edge
+	return -minf(d - r_in, r - d)
 
 static func hazards_at(ll: Vector2, hazards: Array, only_blocked: bool = false) -> Array:
 	var out: Array = []

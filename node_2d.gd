@@ -1,8 +1,10 @@
 extends Node2D
 
-const APP_NAME := "AREOGRAPH"
-const APP_TAG := "Mars navigation & information system"
+const APP_NAME := "MarsGuardian"
+const APP_TAG := "Mars navigation & hazard-safety system"
 const CREDIT := "Designed by: Abdulrahman & Saleh"
+const Nav := preload("res://nav_system.gd")
+const Haz := preload("res://hazard_data.gd")
 
 const WORLD_Z := 7
 const TILE := 256
@@ -711,6 +713,29 @@ var detail_tween: Tween
 var nav_segs: Array = []
 var nav_a := -1
 var nav_b := -1
+var nav_hazards: Array = []      # hazard dictionaries used by the route planner
+var zone_draw: Array = []        # cached world-space outlines of restricted / caution zones
+var show_zones := true
+var nav_plan: Dictionary = {}
+var gps = null                   # Nav.GpsSim while a drive is running
+var drive_on := false
+var drive_km := 0.0
+var drive_speed := 0.14
+var drive_heading := 0.0
+var drive_mult := 1.0
+var drive_cum := PackedFloat32Array()
+var drive_alert := ""
+var drive_ui_t := 0.0
+var expert := false
+var expert_nodes: Array = []
+var prio_opt: OptionButton
+var veh_opt: OptionButton
+var drive_btn: Button
+var speed_btn: Button
+var mode_btn: Button
+var gps_label: Label
+var alert_panel: PanelContainer
+var alert_label: Label
 
 # UI refs
 var poi: PoiView
@@ -861,10 +886,10 @@ func _ready() -> void:
 	# ---- global places ----
 	for cat in CATS:
 		cat_on[cat] = true
-	for e in PLACES:
+	for e in PLACES + Haz.EXTRA_PLACES:
 		var cat: String = e[2]
 		var cd: Dictionary = CATS[cat]
-		var facts: Array = e[7]
+		var facts: Array = _facts(e[7])
 		var ring := Color.WHITE
 		for f in facts:
 			if f[0] == "Status":
@@ -878,13 +903,14 @@ func _ready() -> void:
 				else:
 					ring = Color(0.62, 0.62, 0.68)
 		places.append({"id": e[0], "name": e[1], "cat": cat, "lat": float(e[3]), "lon": float(e[4]),
-			"tier": int(e[5]), "info": e[6], "facts": facts, "hide_local": bool(e[8]),
+			"tier": int(e[5]), "info": e[6], "facts": facts, "hide_local": e.size() > 8 and bool(e[8]),
 			"color": cd["color"], "icon": cd["icon"], "ring": ring, "pos": _ll(float(e[3]), float(e[4]))})
 	prio_order = range(places.size())
 	prio_order.sort_custom(func(a, b): return int(places[a]["tier"]) < int(places[b]["tier"]))
 	draw_order = prio_order.duplicate()
 	draw_order.reverse()
 
+	_build_hazards()
 	_build_ui()
 	_apply_layers()
 	_refresh_list()
@@ -1026,6 +1052,7 @@ func _clamp_center(p: Vector2, z: float) -> Vector2:
 
 func _process(delta: float) -> void:
 	anim_t += delta
+	_update_drive(delta)
 	vp_size = get_viewport_rect().size
 	min_zoom = maxf(vp_size.x / world_w, vp_size.y / world_h)
 
@@ -1644,7 +1671,9 @@ func _draw_label(c: Control, font: Font, sp: Vector2, p: Dictionary, r: float) -
 func draw_overlay(c: Control) -> void:
 	var font := ThemeDB.fallback_font
 	var z := cam.zoom.x
+	_draw_hazards(c)
 	_draw_nav(c)
+	_draw_drive(c)
 	for i in draw_order:
 		if i == sel_place or i == hover_place:
 			continue
@@ -1888,6 +1917,8 @@ func _build_ui() -> void:
 	th.add_child(_spacer())
 	clock_label = _lbl("", BLUE, 12)
 	th.add_child(clock_label)
+	mode_btn = _button("Mode: Simple", _toggle_mode)
+	th.add_child(mode_btn)
 
 	# ---- left sidebar ----
 	var side := PanelContainer.new()
@@ -1961,7 +1992,8 @@ func _build_ui() -> void:
 	ly.add_child(_toggle("CTX detail (5 m)", true, BLUE, Vector2(12, 12), _on_ctx))
 	ly.add_child(_toggle("HiRISE (Jezero only)", false, BLUE, Vector2(12, 12), _on_hirise))
 	ly.add_child(_toggle("Elevation tint (MOLA)", false, BLUE, Vector2(12, 12), _on_tint))
-	ly.add_child(_lbl("Detail strength", DIM, 12))
+	var ds_lbl := _lbl("Detail strength", DIM, 12)
+	ly.add_child(ds_lbl)
 	var sl := HSlider.new()
 	sl.min_value = 0.0
 	sl.max_value = 1.0
@@ -1976,6 +2008,7 @@ func _build_ui() -> void:
 	ly.add_child(layer_stats)
 	ly.add_child(_line(ORANGE))
 	ly.add_child(_head("OVERLAYS", ORANGE))
+	ly.add_child(_toggle("Restricted & hazard zones", true, HAZ_RED, Vector2(12, 12), _on_zones))
 	ly.add_child(_toggle("Lat/lon grid", true, SILVER, Vector2(12, 12), _on_grid))
 	ly.add_child(_line(ORANGE))
 	ly.add_child(_head("JEZERO OPERATIONS  (zoom in to see)", ORANGE))
@@ -1990,7 +2023,7 @@ func _build_ui() -> void:
 
 	# Navigate tab
 	var nv: VBoxContainer = tab_bodies[2]
-	nv.add_child(_head("ROUTE PLANNER", GREEN))
+	nv.add_child(_head("SAFE ROUTE", GREEN))
 	nv.add_child(_lbl("From", DIM, 12))
 	from_opt = OptionButton.new()
 	nv.add_child(from_opt)
@@ -2003,18 +2036,43 @@ func _build_ui() -> void:
 		from_opt.add_item(str(places[i]["name"]), i)
 		to_opt.add_item(str(places[i]["name"]), i)
 	_opt_select(from_opt, _pi("perseverance"))
-	_opt_select(to_opt, _pi("curiosity"))
+	_opt_select(to_opt, _pi("jezero"))
+	nv.add_child(_lbl("Vehicle", DIM, 12))
+	veh_opt = OptionButton.new()
+	for vi in range(TRAVEL_MODES.size()):
+		veh_opt.add_item(str(TRAVEL_MODES[vi][0]), vi)
+	nv.add_child(veh_opt)
+	nv.add_child(_lbl("Priority", DIM, 12))
+	prio_opt = OptionButton.new()
+	prio_opt.add_item("Safest", 0)
+	prio_opt.add_item("Balanced", 1)
+	prio_opt.add_item("Fastest", 2)
+	prio_opt.select(1)
+	nv.add_child(prio_opt)
 	var nb := HBoxContainer.new()
 	nb.add_theme_constant_override("separation", 6)
 	nv.add_child(nb)
-	var pb := _button("Plan route", _plan_route)
+	var pb := _button("Plan safe route", _plan_route)
 	pb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	nb.add_child(pb)
 	nb.add_child(_button("Swap", _swap_route))
 	nb.add_child(_button("Clear", _clear_route))
 	nav_info = _wrap("Pick two places and press Plan route.", Color.WHITE, 12, 260.0)
 	nv.add_child(nav_info)
-	nv.add_child(_wrap("Great-circle estimate. It ignores terrain, hazards and weather. Vehicles marked concept do not exist yet.", ORANGE, 11, 260.0))
+	nv.add_child(_line(ORANGE))
+	nv.add_child(_head("GUIDANCE", ICE))
+	var db := HBoxContainer.new()
+	db.add_theme_constant_override("separation", 6)
+	nv.add_child(db)
+	drive_btn = _button("Start simulated drive", _start_drive)
+	drive_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	drive_btn.disabled = true
+	db.add_child(drive_btn)
+	speed_btn = _button("1x", _cycle_speed)
+	db.add_child(speed_btn)
+	gps_label = _wrap("", ICE, 12, 260.0)
+	nv.add_child(gps_label)
+	nv.add_child(_wrap("Mars has no GPS satellites. This simulator drifts while driving and is corrected by orbiter beacon fixes. Zones are illustrative, not official NASA data.", ORANGE, 11, 260.0))
 
 	# ---- right: details drawer ----
 	card_panel = PanelContainer.new()
@@ -2131,6 +2189,16 @@ func _build_ui() -> void:
 	bh.add_child(VSeparator.new())
 	bh.add_child(_lbl(CREDIT, Color(1, 1, 1, 0.55), 10))
 
+	alert_panel = PanelContainer.new()
+	alert_panel.add_theme_stylebox_override("panel", _flat(Color(0.55, 0.04, 0.04, 0.95), 8, 10))
+	_anchor_rect(alert_panel, 0.5, 0, 0.5, 0, -270, 62, 270, 110)
+	alert_panel.visible = false
+	uroot.add_child(alert_panel)
+	alert_label = _wrap("", Color.WHITE, 15, 520.0)
+	alert_panel.add_child(alert_label)
+
+	expert_nodes = [ds_lbl, sl, sharp_btn, layer_stats, res_label, tile_status]
+	_apply_mode()
 	_update_scale()
 	_update_status()
 
@@ -2384,59 +2452,35 @@ func _stop_play() -> void:
 	if card_tele:
 		card_tele.visible = false
 
-# ---------------- Navigation planner ----------------
-func _vec(lat: float, lon: float) -> Vector3:
-	var la := deg_to_rad(lat)
-	var lo := deg_to_rad(lon)
-	return Vector3(cos(la) * cos(lo), cos(la) * sin(lo), sin(la))
-
-func _gc(lat1: float, lon1: float, lat2: float, lon2: float, n: int) -> Array:
-	var a := _vec(lat1, lon1)
-	var b := _vec(lat2, lon2)
-	var om := acos(clampf(a.dot(b), -1.0, 1.0))
+# Planner + simulated GPS. The route comes from nav_system.gd (hazard-aware A*).
+func _facts(v) -> Array:
+	if v is Array:
+		return v
 	var out: Array = []
-	if om < 0.000001 or om > 3.1415:
-		out.append(Vector2(lat1, lon1))
-		out.append(Vector2(lat2, lon2))
-		return out
-	var so := sin(om)
-	for i in range(n + 1):
-		var t := float(i) / float(n)
-		var v := a * (sin((1.0 - t) * om) / so) + b * (sin(t * om) / so)
-		out.append(Vector2(rad_to_deg(asin(clampf(v.z, -1.0, 1.0))), rad_to_deg(atan2(v.y, v.x))))
+	for part in str(v).split("; "):
+		var kv := part.split(": ", true, 1)
+		if kv.size() == 2:
+			out.append([kv[0], kv[1]])
 	return out
 
-func _compass(deg: float) -> String:
-	var names := ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-	return names[int(round(deg / 45.0)) % 8]
+func _vehicle_opts() -> Dictionary:
+	var vi := 0
+	var pi_ := 1
+	if veh_opt != null:
+		vi = clampi(veh_opt.get_selected_id(), 0, TRAVEL_MODES.size() - 1)
+	if prio_opt != null:
+		pi_ = clampi(prio_opt.get_selected_id(), 0, 2)
+	var names: Array = ["safest", "balanced", "fastest"]
+	return {"priority": names[pi_], "air": vi == 2, "speed_kmh": float(TRAVEL_MODES[vi][1])}
 
-func _fmt_dur(hours: float) -> String:
-	if hours < 1.0:
-		return "%d min" % int(round(hours * 60.0))
-	if hours < 48.0:
-		return "%.1f h" % hours
-	return "%.0f days (%d sols)" % [hours / 24.0, int(round(hours / 24.6597))]
-
-func _plan_route() -> void:
-	var ia := from_opt.get_selected_id()
-	var ib := to_opt.get_selected_id()
-	if ia < 0 or ib < 0 or ia == ib:
-		nav_info.text = "Choose two different places."
-		return
-	var a: Dictionary = places[ia]
-	var b: Dictionary = places[ib]
-	var la1 := float(a["lat"])
-	var lo1 := float(a["lon"])
-	var la2 := float(b["lat"])
-	var lo2 := float(b["lon"])
-	var pts := _gc(la1, lo1, la2, lo2, 120)
+func _set_nav_segs(path: Array) -> Rect2:
 	nav_segs.clear()
 	var seg := PackedVector2Array()
 	var prev_lon := 0.0
 	var mn := Vector2(INF, INF)
 	var mx := Vector2(-INF, -INF)
-	for i in range(pts.size()):
-		var ll: Vector2 = pts[i]
+	for i in range(path.size()):
+		var ll: Vector2 = path[i]
 		if i > 0 and absf(ll.y - prev_lon) > 180.0:
 			nav_segs.append(seg)
 			seg = PackedVector2Array()
@@ -2446,21 +2490,61 @@ func _plan_route() -> void:
 		mx = Vector2(maxf(mx.x, w.x), maxf(mx.y, w.y))
 		prev_lon = ll.y
 	nav_segs.append(seg)
+	return Rect2(mn, mx - mn)
+
+func _plan_text(plan: Dictionary, a: Dictionary, b: Dictionary) -> String:
+	var t: String = "%s  >  %s\nRISK: %s\n" % [a["name"], b["name"], plan["risk"]]
+	t += "Route %s (direct %s, +%d%%)\nDrive time: %s\n" % [Nav.fmt_dist(float(plan["length_km"])),
+		Nav.fmt_dist(float(plan["direct_km"])), int(round(float(plan["detour_pct"]))), Nav.fmt_dur(float(plan["time_h"]))]
+	if str(plan["min_clear_name"]) != "":
+		t += "Closest keep-out: %s, %s\n" % [plan["min_clear_name"], Nav.fmt_dist(float(plan["min_clear_km"]))]
+	var avoided: Array = []
+	for h in plan["avoided"]:
+		var nm := str(h["name"]) if h is Dictionary else str(h)
+		if not avoided.has(nm):
+			avoided.append(nm)
+	if not avoided.is_empty():
+		t += "Goes around: " + ", ".join(avoided) + "\n"
+	for w in plan["warnings"]:
+		t += "! %s\n" % str(w)
+	var steps: Array = plan["steps"]
+	t += "\nSTEPS"
+	for i in range(mini(steps.size(), 8)):
+		t += "\n%d. %s" % [i + 1, steps[i]["text"]]
+	if steps.size() > 8:
+		t += "\n... %d more steps" % (steps.size() - 8)
+	return t
+
+func _plan_route() -> void:
+	var ia := from_opt.get_selected_id()
+	var ib := to_opt.get_selected_id()
+	if ia < 0 or ib < 0 or ia == ib:
+		nav_info.text = "Choose two different places."
+		return
+	_stop_drive()
+	gps = null
+	var a: Dictionary = places[ia]
+	var b: Dictionary = places[ib]
+	var opts := _vehicle_opts()
+	opts["dest_name"] = str(b["name"])
+	var plan: Dictionary = Nav.plan(Vector2(float(a["lat"]), float(a["lon"])),
+		Vector2(float(b["lat"]), float(b["lon"])), nav_hazards, opts)
 	nav_a = ia
 	nav_b = ib
-	var d_km := acos(clampf(_vec(la1, lo1).dot(_vec(la2, lo2)), -1.0, 1.0)) * MARS_R_KM
-	var p1 := deg_to_rad(la1)
-	var p2 := deg_to_rad(la2)
-	var dl := deg_to_rad(lo2 - lo1)
-	var by := sin(dl) * cos(p2)
-	var bx := cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
-	var brg := fposmod(rad_to_deg(atan2(by, bx)), 360.0)
-	var txt := "%s  >  %s\nDistance: %.0f km (great-circle)\nStart bearing: %03d° %s\n\nTravel time, non-stop:" % [a["name"], b["name"], d_km, int(brg), _compass(brg)]
-	for m in TRAVEL_MODES:
-		txt += "\n  %s: %s" % [m[0], _fmt_dur(d_km / float(m[1]))]
-	nav_info.text = txt
-	var zf := minf(vp_size.x * 0.45 / maxf(mx.x - mn.x, 1.0), vp_size.y * 0.55 / maxf(mx.y - mn.y, 1.0))
-	_fly_to((mn + mx) * 0.5, clampf(zf, min_zoom, 20.0))
+	if not bool(plan["ok"]):
+		nav_plan = {}
+		nav_segs.clear()
+		drive_btn.disabled = true
+		gps_label.text = ""
+		nav_info.text = "NO SAFE ROUTE\n" + str(plan["reason"])
+		return
+	nav_plan = plan
+	var r := _set_nav_segs(plan["path"])
+	nav_info.text = _plan_text(plan, a, b)
+	drive_btn.disabled = false
+	gps_label.text = "Press Start simulated drive to follow this route with a simulated GPS."
+	var zf := minf(vp_size.x * 0.45 / maxf(r.size.x, 1.0), vp_size.y * 0.55 / maxf(r.size.y, 1.0))
+	_fly_to(r.get_center(), clampf(zf, min_zoom, 20.0))
 
 func _swap_route() -> void:
 	var ia := from_opt.get_selected_id()
@@ -2471,10 +2555,282 @@ func _swap_route() -> void:
 		_plan_route()
 
 func _clear_route() -> void:
+	_stop_drive()
+	gps = null
+	nav_plan = {}
 	nav_segs.clear()
 	nav_a = -1
 	nav_b = -1
+	drive_btn.disabled = true
+	gps_label.text = ""
 	nav_info.text = "Pick two places and press Plan route."
+
+func _start_drive() -> void:
+	if drive_on:
+		_stop_drive()
+		return
+	if nav_plan.is_empty():
+		return
+	var path: Array = nav_plan["path"]
+	drive_cum = Nav.cumulative(path)
+	gps = Nav.GpsSim.new()
+	gps.place(path[0])
+	drive_km = 0.0
+	drive_speed = float(_vehicle_opts()["speed_kmh"])
+	drive_on = true
+	drive_btn.text = "Stop drive"
+	_update_drive(0.0)
+	_refresh_drive_ui()
+
+func _stop_drive() -> void:
+	drive_on = false
+	drive_alert = ""
+	if drive_btn != null:
+		drive_btn.text = "Start simulated drive"
+	if alert_panel != null:
+		alert_panel.visible = false
+
+func _cycle_speed() -> void:
+	var seq: Array = [1.0, 2.0, 4.0, 8.0]
+	var i := seq.find(drive_mult)
+	drive_mult = float(seq[(i + 1) % seq.size()])
+	speed_btn.text = "%dx" % int(drive_mult)
+
+func _set_alert(text: String, danger: bool) -> void:
+	drive_alert = text
+	if alert_panel == null:
+		return
+	alert_panel.visible = text != ""
+	alert_label.text = text
+	var bg := Color(0.55, 0.04, 0.04, 0.95) if danger else Color(0.05, 0.35, 0.18, 0.95)
+	alert_panel.add_theme_stylebox_override("panel", _flat(bg, 8, 10))
+
+func _update_drive(delta: float) -> void:
+	if not drive_on or gps == null or nav_plan.is_empty():
+		return
+	var path: Array = nav_plan["path"]
+	var total: float = drive_cum[drive_cum.size() - 1]
+	# the whole trip takes about 60 real seconds at 1x, whatever the vehicle speed
+	var sim_h_per_s := total / maxf(drive_speed, 0.001) / 60.0 * drive_mult
+	var dt_h := delta * sim_h_per_s
+	var moved := minf(drive_speed * dt_h, total - drive_km)
+	drive_km += moved
+	var pt := Nav.point_at(path, drive_cum, drive_km)
+	gps.true_ll = pt["ll"]
+	drive_heading = float(pt["heading"])
+	var here: Array = Nav.hazards_at(gps.true_ll, nav_hazards)
+	var dusty := false
+	for h in here:
+		if str(h["kind"]) == "dust":
+			dusty = true
+	gps.step(dt_h * 3600.0, moved, dusty)
+	drive_ui_t += delta
+	if drive_ui_t >= 0.15 or drive_km >= total - 0.0005:
+		drive_ui_t = 0.0
+		_refresh_drive_ui()
+	if drive_km >= total - 0.0005:
+		drive_on = false
+		drive_btn.text = "Start simulated drive"
+		_set_alert("ARRIVED at " + str(places[nav_b]["name"]), false)
+
+func _refresh_drive_ui() -> void:
+	if gps == null or nav_plan.is_empty():
+		return
+	var path: Array = nav_plan["path"]
+	var total: float = drive_cum[drive_cum.size() - 1]
+	var est: Vector2 = gps.est_ll()
+	var pr: Dictionary = Nav.project(path, drive_cum, est)
+	var s_est := clampf(float(pr["s"]), 0.0, total)
+	var steps: Array = nav_plan["steps"]
+	var si := 0
+	for i in range(steps.size()):
+		if float(steps[i]["at_km"]) <= s_est + 0.001:
+			si = i
+	var nxt := mini(si + 1, steps.size() - 1)
+	var to_next := maxf(float(steps[nxt]["at_km"]) - s_est, 0.0)
+	var near_name := ""
+	var near_km := INF
+	for h in nav_hazards:
+		if not bool(h["blocked"]):
+			continue
+		var d := Nav.edge_dist(h, est)
+		if d < near_km:
+			near_km = d
+			near_name = str(h["name"])
+	var t: String = "GPS (simulated)\nFix: %s\nAccuracy: %s  +/-%d m\n" % [gps.fix_state, gps.quality(), int(round(gps.accuracy_m))]
+	t += "Position: %s\nHeading: %03d° %s\n" % [_fmt_ll(est.x, est.y), int(drive_heading), Nav.compass(drive_heading)]
+	t += "Progress: %s of %s (%d%%)\n" % [Nav.fmt_dist(s_est), Nav.fmt_dist(total), int(round(100.0 * s_est / maxf(total, 0.001)))]
+	t += "\nNOW: %s" % str(steps[si]["text"])
+	if nxt != si:
+		t += "\nNEXT in %s: %s" % [Nav.fmt_dist(to_next), str(steps[nxt]["text"])]
+	if near_name != "":
+		t += "\n\nNearest keep-out: %s, %s" % [near_name, Nav.fmt_dist(maxf(near_km, 0.0))]
+	gps_label.text = t
+	if not drive_on:
+		return
+	var warn := ""
+	var danger := true
+	if near_km < 0.0:
+		warn = "STOP. Inside restricted area: " + near_name
+	elif near_km * 1000.0 < maxf(500.0, gps.accuracy_m * 2.0):
+		warn = "KEEP-OUT %s from %s. Stay on the route." % [Nav.fmt_dist(near_km), near_name]
+	elif gps.quality() == "POOR":
+		warn = "GPS accuracy POOR. Slow down and use visual navigation."
+	else:
+		for h2 in Nav.hazards_at(gps.true_ll, nav_hazards):
+			warn = "CAUTION: inside %s. %s" % [str(h2["name"]), str(h2["why"])]
+	if warn != drive_alert:
+		_set_alert(warn, danger)
+
+func _draw_drive(c: Control) -> void:
+	if gps == null:
+		return
+	var est: Vector2 = gps.est_ll()
+	var ep := _s(_ll(est.x, est.y))
+	var tp := _s(_ll(gps.true_ll.x, gps.true_ll.y))
+	var acc_px := maxf(gps.accuracy_m / 1000.0 * px_per_km * cam.zoom.x, 9.0)
+	var cy := Color(0.25, 0.85, 1.0)
+	c.draw_circle(ep, acc_px, Color(cy, 0.14))
+	c.draw_arc(ep, acc_px, 0.0, TAU, 40, Color(cy, 0.9), 2.0)
+	c.draw_circle(ep, 3.5, cy)
+	var br := deg_to_rad(drive_heading)
+	var dir := Vector2(sin(br), -cos(br))
+	var tri := PackedVector2Array([tp + dir * 15.0, tp + dir.rotated(2.5) * 11.0, tp + dir.rotated(-2.5) * 11.0])
+	c.draw_colored_polygon(tri, Color.WHITE)
+	var closed := tri.duplicate()
+	closed.append(tri[0])
+	c.draw_polyline(closed, Color(0, 0, 0, 0.85), 2.0, true)
+
+func _on_zones(on: bool) -> void:
+	show_zones = on
+
+# ---------------- Restricted and caution zones ----------------
+const LOCAL_HAZARD_GROUPS := {"Slope hazards": ["slope", 4.0], "Boulder & dune hazards": ["rock", 8.0],
+	"Dust zones": ["dust", 3.0], "Wind zones": ["wind", 2.5]}
+
+func _build_hazards() -> void:
+	nav_hazards.clear()
+	zone_draw.clear()
+	for r in Haz.RESTRICTED:
+		var h := Nav.hazard(str(r[1]), Vector2(float(r[2]), float(r[3])), float(r[4]), str(r[6]), 1.0, true,
+			str(r[8]), false, float(r[5]))
+		nav_hazards.append(h)
+		zone_draw.append(_zone_shape(h, true))
+	for g in Haz.GLOBAL_HAZARDS:
+		var h2 := Nav.hazard(str(g[0]), Vector2(float(g[1]), float(g[2])), float(g[3]), str(g[4]), float(g[5]),
+			false, str(g[6]))
+		nav_hazards.append(h2)
+		zone_draw.append(_zone_shape(h2, false))
+	for s in SITES:
+		var grp := str(s[0])
+		if not LOCAL_HAZARD_GROUPS.has(grp):
+			continue
+		var spec: Array = LOCAL_HAZARD_GROUPS[grp]
+		var nogo := str(COND[str(s[6])]["drive"]) == "NO-GO"
+		nav_hazards.append(Nav.hazard(str(s[1]), Vector2(float(s[2]), float(s[3])), float(s[4]), str(spec[0]),
+			float(spec[1]), nogo, str(s[5]), nogo))
+
+func _zone_shape(h: Dictionary, blocked: bool) -> Dictionary:
+	var ctr: Vector2 = h["ll"]
+	var outer := PackedVector2Array()
+	var inner := PackedVector2Array()
+	var n := 72
+	for i in range(n):
+		var a := TAU * float(i) / float(n)
+		var dir := Vector2(sin(a), cos(a))
+		var po := Nav.from_xy(dir * float(h["r"]), ctr)
+		outer.append(_ll(po.x, po.y))
+		if float(h["r_in"]) > 0.0:
+			var pn := Nav.from_xy(dir * float(h["r_in"]), ctr)
+			inner.append(_ll(pn.x, pn.y))
+	return {"name": str(h["name"]), "blocked": blocked, "center": _ll(ctr.x, ctr.y), "outer": outer, "inner": inner}
+
+# Hazard-tape outline: alternating colour dashes along a closed outline.
+func _dash_loop(c: Control, pts: PackedVector2Array, col: Color, col2: Color, w: float) -> void:
+	var n := pts.size()
+	var per := 0.0
+	for i in range(n):
+		per += pts[i].distance_to(pts[(i + 1) % n])
+	if per > 8000.0:
+		var closed := pts.duplicate()
+		closed.append(pts[0])
+		c.draw_polyline(closed, col, w, true)
+		return
+	var acc := 0.0
+	for i in range(n):
+		var a := pts[i]
+		var b := pts[(i + 1) % n]
+		var sl := a.distance_to(b)
+		if sl < 0.01:
+			continue
+		var dir := (b - a) / sl
+		var d := 0.0
+		while d < sl:
+			var phase := fposmod(acc + d, 24.0)
+			var step := minf(12.0 - fposmod(phase, 12.0), sl - d)
+			c.draw_line(a + dir * d, a + dir * (d + step), col if phase < 12.0 else col2, w)
+			d += step
+		acc += sl
+
+func _draw_hazards(c: Control) -> void:
+	if not show_zones:
+		return
+	var font := ThemeDB.fallback_font
+	var scr := Rect2(Vector2(-60, -60), vp_size + Vector2(120, 120))
+	for zd in zone_draw:
+		var blocked: bool = zd["blocked"]
+		var outer: PackedVector2Array = zd["outer"]
+		var sp := PackedVector2Array()
+		var bb := Rect2(_s(outer[0]), Vector2.ZERO)
+		for q in outer:
+			var v := _s(q)
+			sp.append(v)
+			bb = bb.expand(v)
+		if not bb.intersects(scr):
+			continue
+		var col := HAZ_RED if blocked else GOLD
+		var col2 := Color(1, 1, 1, 0.92) if blocked else Color(0.12, 0.06, 0.0, 0.92)
+		var big := maxf(bb.size.x, bb.size.y)
+		if big < 10.0:
+			var m := _s(zd["center"])
+			if scr.has_point(m):
+				var dm := PackedVector2Array([m + Vector2(0, -7), m + Vector2(7, 0), m + Vector2(0, 7),
+					m + Vector2(-7, 0), m + Vector2(0, -7)])
+				c.draw_polyline(dm, col, 2.0)
+			continue
+		if big > 40000.0:
+			continue
+		var ring: bool = (zd["inner"] as PackedVector2Array).size() > 0
+		if ring:
+			var inn := PackedVector2Array()
+			for q2 in zd["inner"]:
+				inn.append(_s(q2))
+			for i in range(sp.size()):
+				var j := (i + 1) % sp.size()
+				c.draw_colored_polygon(PackedVector2Array([sp[i], sp[j], inn[j], inn[i]]), Color(col, 0.22))
+			_dash_loop(c, inn, col, col2, 3.0)
+		else:
+			c.draw_colored_polygon(sp, Color(col, 0.20 if blocked else 0.09))
+		_dash_loop(c, sp, col, col2, 4.0 if blocked else 2.5)
+		var lp := _s(zd["center"])
+		if ring:
+			lp = sp[0] + Vector2(0, 16)
+		if big > 70.0 and scr.has_point(lp):
+			var txt := ("RESTRICTED  " if blocked else "CAUTION  ") + str(zd["name"])
+			var w := font.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 13).x
+			c.draw_rect(Rect2(lp - Vector2(w * 0.5 + 6.0, 12.0), Vector2(w + 12.0, 22.0)), Color(0, 0, 0, 0.7))
+			c.draw_string(font, lp + Vector2(-w * 0.5, 5.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 13, col)
+
+func _toggle_mode() -> void:
+	expert = not expert
+	_apply_mode()
+
+func _apply_mode() -> void:
+	for n in expert_nodes:
+		if n != null:
+			n.visible = expert
+	if mode_btn != null:
+		mode_btn.text = "Mode: Expert" if expert else "Mode: Simple"
 
 # ---------------- Camera moves ----------------
 func _fly_to(p: Vector2, z: float) -> void:
