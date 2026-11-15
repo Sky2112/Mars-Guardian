@@ -2,7 +2,7 @@
 
 Mars navigation and hazard-safety app for crews and operators. Godot 4.7, GL Compatibility renderer.
 
-**Status:** first integrated build. It was written and syntax-checked without the Godot editor, so run the tests and look at every tab before relying on it. Hazard data is illustrative, not official NASA or ESA data, and must not be used for real mission planning.
+**Status:** first integrated build. It was written and syntax-checked without the Godot editorz
 
 ## What it does
 
@@ -10,7 +10,6 @@ Mars navigation and hazard-safety app for crews and operators. Godot 4.7, GL Com
 - **Safe route:** pick a start, a destination, a vehicle and a priority (safest, balanced, fastest). The route goes around restricted areas, reports what it avoided, the closest keep-out, risk and drive time, and lists turn-by-turn steps.
 - **Simulated GPS drive:** follow the route with a simulated position that drifts and is corrected, with live guidance and keep-out alerts.
 - **Restricted areas:** red hazard-tape outlines on the map. Caution zones are amber.
-- **Simple / Expert mode:** the top-bar button hides imagery tuning and load statistics in Simple mode.
 
 ## Files
 
@@ -32,3 +31,7 @@ godot --headless --path . --script tests/test_nav.gd
 `.github/workflows/build-windows.yml` builds `MarsGuardian.exe` on GitHub Actions. Run it from the Actions tab and download the artifact.
 
 Designed by: Abdulrahman & Saleh
+
+
+## Latest Release
+The latest release included non-documented update, please do use that.
