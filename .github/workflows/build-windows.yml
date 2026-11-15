@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  GODOT_VERSION: "4.7.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Godot and export templates
+        run: |
+          BASE="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable"
+          curl -fsSL -o godot.zip "$BASE/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          curl -fsSL -o templates.tpz "$BASE/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -q godot.zip
+          sudo mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+
+      - name: Adjust preset for Linux runner (runner copy only)
+        run: |
+          sed -i 's#application/modify_resources=true#application/modify_resources=false#' export_presets.cfg
+          sed -i 's#binary_format/embed_pck=false#binary_format/embed_pck=true#' export_presets.cfg
+
+      - name: Import project
+        run: godot --headless --path . --import || true
+
+      - name: Export Windows build
+        run: |
+          mkdir -p build
+          godot --headless --path . --export-release "Windows Desktop" build/MarsGuardian.exe
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MarsGuardian-windows
+          path: build/
